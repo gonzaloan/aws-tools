@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 import json
-import sys
 import boto3
 import logging
 import argparse
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional
 from botocore.exceptions import ClientError
 from colorama import init, Fore, Style
 
@@ -231,36 +230,6 @@ class AWSResourceMonitor:
 
         return {}
 
-    def _analyze_vpc_changes(self, event: Dict) -> Dict:
-        """Analyze VPC specific changes"""
-        changes = {}
-        try:
-            event_detail = json.loads(event.get('CloudTrailEvent', '{}'))
-            request_params = event_detail.get('requestParameters', {})
-
-            if 'ModifyVpcAttribute' in event['EventName']:
-                for attr in ['enableDnsHostnames', 'enableDnsSupport']:
-                    if attr in request_params:
-                        value = request_params[attr].get('value', 'unknown')
-                        changes['attribute'] = f"{attr} set to: {value}"
-
-            elif 'CreateVpcPeeringConnection' in event['EventName']:
-                peer_vpc = request_params.get('peerVpcId', 'unknown')
-                changes['peering'] = f"Created peering connection with VPC: {peer_vpc}"
-
-            elif 'AcceptVpcPeeringConnection' in event['EventName']:
-                connection_id = request_params.get('vpcPeeringConnectionId', 'unknown')
-                changes['peering'] = f"Accepted peering connection: {connection_id}"
-
-            elif 'AttachInternetGateway' in event['EventName']:
-                gateway_id = request_params.get('internetGatewayId', 'unknown')
-                changes['internet_gateway'] = f"Attached internet gateway: {gateway_id}"
-
-        except json.JSONDecodeError:
-            logger.warning("Could not parse CloudTrail event JSON")
-
-        return changes
-
     def _analyze_subnet_changes(self, event: Dict) -> Dict:
         """Analyze subnet specific changes"""
         changes = {}
@@ -308,19 +277,42 @@ class AWSResourceMonitor:
         return {}
 
     def _get_related_resources(self) -> List[Dict]:
-        """Get related resources and their changes"""
+        """Get related resources and their changes with enhanced details"""
         try:
             function = self.lambda_client.get_function(FunctionName=self.resource_identifier)
             vpc_config = function['Configuration'].get('VpcConfig', {})
             related_resources = []
 
             if vpc_config:
-                # Analyze Security Groups
+                # Get VPC details
+                vpc_id = vpc_config.get('VpcId')
+                if vpc_id:
+                    try:
+                        vpc = self.ec2_client.describe_vpc(VpcId=vpc_id)['Vpc']
+                        vpc_events = self._get_cloudtrail_events(vpc_id)
+                        vpc_changes = self._analyze_changes(vpc_events, 'vpc')
+
+                        related_resources.append({
+                            'type': 'vpc',
+                            'identifier': vpc_id,
+                            'cidr': vpc.get('CidrBlock', 'Unknown'),
+                            'state': vpc.get('State', 'Unknown'),
+                            'is_default': vpc.get('IsDefault', False),
+                            'changes': vpc_changes
+                        })
+                    except ClientError as e:
+                        logger.warning(f"Error getting VPC details: {e}")
+
+                # Get Security Group details with enhanced information
                 for sg_id in vpc_config.get('SecurityGroupIds', []):
                     try:
                         sg = self.ec2_client.describe_security_groups(GroupIds=[sg_id])['SecurityGroups'][0]
                         sg_events = self._get_cloudtrail_events(sg_id)
                         sg_changes = self._analyze_changes(sg_events, 'security_group')
+
+                        # Get active rules count
+                        inbound_rules = len(sg.get('IpPermissions', []))
+                        outbound_rules = len(sg.get('IpPermissionsEgress', []))
 
                         related_resources.append({
                             'type': 'security_group',
@@ -328,12 +320,14 @@ class AWSResourceMonitor:
                             'name': sg.get('GroupName', 'Unknown'),
                             'description': sg.get('Description', 'No description'),
                             'vpc_id': sg.get('VpcId', 'Unknown'),
+                            'inbound_rules': inbound_rules,
+                            'outbound_rules': outbound_rules,
                             'changes': sg_changes
                         })
                     except ClientError as e:
                         logger.error(f"Error analyzing security group {sg_id}: {e}")
 
-                # Analyze Subnets
+                # Get Subnet details with enhanced information
                 for subnet_id in vpc_config.get('SubnetIds', []):
                     try:
                         subnet = self.ec2_client.describe_subnets(SubnetIds=[subnet_id])['Subnets'][0]
@@ -346,24 +340,39 @@ class AWSResourceMonitor:
                             'cidr': subnet.get('CidrBlock', 'Unknown'),
                             'vpc_id': subnet.get('VpcId', 'Unknown'),
                             'az': subnet.get('AvailabilityZone', 'Unknown'),
+                            'state': subnet.get('State', 'Unknown'),
+                            'available_ip_count': subnet.get('AvailableIpAddressCount', 0),
+                            'public_ip_on_launch': subnet.get('MapPublicIpOnLaunch', False),
                             'changes': subnet_changes
                         })
                     except ClientError as e:
                         logger.error(f"Error analyzing subnet {subnet_id}: {e}")
 
-            # Analyze IAM Role
-            iam_role = function['Configuration'].get('Role')
-            if iam_role:
-                role_name = iam_role.split('/')[-1]
-                role_events = self._get_cloudtrail_events(role_name)
-                role_changes = self._analyze_changes(role_events, 'iam_role')
+            # Get IAM Role details with enhanced information
+            role_arn = function['Configuration'].get('Role')
+            if role_arn:
+                try:
+                    role_name = role_arn.split('/')[-1]
+                    role = self.iam_client.get_role(RoleName=role_name)['Role']
+                    role_events = self._get_cloudtrail_events(role_name)
+                    role_changes = self._analyze_changes(role_events, 'iam_role')
 
-                related_resources.append({
-                    'type': 'iam_role',
-                    'identifier': iam_role,
-                    'name': role_name,
-                    'changes': role_changes
-                })
+                    # Get attached policies
+                    attached_policies = self.iam_client.list_attached_role_policies(RoleName=role_name)[
+                        'AttachedPolicies']
+
+                    related_resources.append({
+                        'type': 'iam_role',
+                        'identifier': role_arn,
+                        'name': role_name,
+                        'description': role.get('Description', 'No description'),
+                        'created_date': role.get('CreateDate', 'Unknown'),
+                        'last_used': role.get('RoleLastUsed', {}).get('LastUsedDate', 'Never'),
+                        'attached_policies': [p['PolicyName'] for p in attached_policies],
+                        'changes': role_changes
+                    })
+                except ClientError as e:
+                    logger.error(f"Error analyzing IAM role: {e}")
 
             return related_resources
 
@@ -376,51 +385,43 @@ class AWSResourceMonitor:
         Main analysis method to detect and report changes
         """
         try:
-            # Get resource type and basic info
-            resource_type = self._get_resource_type()
-            resource_arn = self._get_resource_arn()
-
-            # Initialize the basic report structure
-            report = {
-                'resource_identifier': self.resource_identifier,
-                'resource_type': resource_type,
-                'analysis_period_days': self.days,
-                'analysis_time': datetime.utcnow().isoformat(),
-                'changes': [],
-                'related_resources': []
-            }
+            # Get Lambda function details
+            function = self.lambda_client.get_function(FunctionName=self.resource_identifier)
+            config = function['Configuration']
 
             # Get main resource changes
             events = self._get_cloudtrail_events()
-            report['changes'] = self._analyze_changes(events, resource_type)
+            changes = self._analyze_changes(events)
 
-            # Handle Lambda-specific details
-            if resource_type == 'lambda':
-                try:
-                    function = self.lambda_client.get_function(FunctionName=self.resource_identifier)
-                    config = function['Configuration']
+            # Get Lambda configuration details
+            lambda_details = {
+                'runtime': config.get('Runtime', 'Unknown'),
+                'memory': config.get('MemorySize', 'Unknown'),
+                'timeout': config.get('Timeout', 'Unknown'),
+                'handler': config.get('Handler', 'Unknown'),
+                'last_modified': config.get('LastModified', 'Unknown')
+            }
 
-                    report['lambda_details'] = {
-                        'runtime': config.get('Runtime', 'Unknown'),
-                        'memory': config.get('MemorySize', 'Unknown'),
-                        'timeout': config.get('Timeout', 'Unknown'),
-                        'handler': config.get('Handler', 'Unknown'),
-                        'last_modified': config.get('LastModified', 'Unknown')
-                    }
+            # Get related resources if requested
+            related_resources = []
+            if self.include_related:
+                related_resources = self._get_related_resources()
 
-                    # Get related resources if requested
-                    if self.include_related:
-                        report['related_resources'] = self._get_related_resources()
-                except ClientError as e:
-                    logger.error(f"Error getting Lambda details: {e}")
-                    report['lambda_details'] = {
-                        'error': f"Could not retrieve Lambda details: {str(e)}"
-                    }
+            # Create the complete report
+            report = {
+                'resource_identifier': self.resource_identifier,
+                'resource_type': 'lambda',
+                'lambda_details': lambda_details,
+                'analysis_period_days': self.days,
+                'analysis_time': datetime.utcnow().isoformat(),
+                'changes': changes,
+                'related_resources': related_resources
+            }
 
             return report
 
-        except Exception as e:
-            logger.error(f"Error analyzing resource: {e}")
+        except ClientError as e:
+            logger.error(f"Error analyzing Lambda function: {e}")
             raise
 
 
@@ -458,165 +459,45 @@ def print_changes(changes: List[Dict], resource_type: str, indent: str = "") -> 
 
 
 def print_related_resources(resources: List[Dict]):
-    """Print related resources information with detailed configuration"""
+    """Print related resources information with enhanced details"""
     if not resources:
         print(f"\n{Fore.YELLOW}No related resources found{Style.RESET_ALL}")
         return
 
-    # Group resources by type
-    resource_groups = {
-        'vpc': [],
-        'security_group': [],
-        'subnet': [],
-        'iam_role': []
-    }
-
     for resource in resources:
-        if resource['type'] in resource_groups:
-            resource_groups[resource['type']].append(resource)
+        resource_type = resource['type']
+        color = AWSResourceMonitor.RESOURCE_TYPE_COLORS.get(resource_type, Fore.WHITE)
 
-    # Print VPC information
-    if resource_groups['vpc']:
-        print(f"\n{Fore.CYAN}VPC Configuration:{Style.RESET_ALL}")
-        for vpc in resource_groups['vpc']:
-            print(f"\n  {Fore.WHITE}• VPC ID: {vpc['identifier']}{Style.RESET_ALL}")
-            print(f"    CIDR Block: {vpc['cidr']}")
-            print(f"    State: {vpc['state']}")
-            print(f"    Default VPC: {'Yes' if vpc['is_default'] else 'No'}")
+        print(f"\n{color}=== {resource_type.upper()} Details ==={Style.RESET_ALL}")
 
-            if vpc['changes']:
-                print(f"\n    Changes detected:")
-                for change in vpc['changes']:
-                    print(f"\n    [{change['timestamp']}]")
-                    print(f"    Modified by: {change['user']}")
+        if resource_type == 'security_group':
+            print(f"  Identifier: {resource['identifier']}")
+            print(f"  Name: {resource['name']}")
+            print(f"  Description: {resource['description']}")
+            print(f"  VPC: {resource['vpc_id']}")
+        elif resource_type == 'subnet':
+            print(f"  Identifier: {resource['identifier']}")
+            print(f"  CIDR Block: {resource['cidr']}")
+            print(f"  VPC: {resource['vpc_id']}")
+            print(f"  Availability Zone: {resource['az']}")
+        elif resource_type == 'iam_role':
+            print(f"  ARN: {resource['identifier']}")
+            print(f"  Name: {resource['name']}")
+
+        if resource.get('changes'):
+            print(f"\n  {Fore.CYAN}Change History:{Style.RESET_ALL}")
+            for change in resource['changes']:
+                timestamp = datetime.strptime(str(change['timestamp']), "%Y-%m-%d %H:%M:%S%z")
+                formatted_time = timestamp.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+                print(f"\n    {Fore.WHITE}[{formatted_time}]{Style.RESET_ALL}")
+                print(f"    Modified by: {Fore.YELLOW}{change['user']}{Style.RESET_ALL}")
+                print(f"    Event: {change['event_type']}")
+
+                if change.get('changes'):
                     for change_type, desc in change['changes'].items():
-                        print(f"      - {change_type}: {desc}")
-
-    # Print Security Groups
-    if resource_groups['security_group']:
-        print(f"\n{Fore.YELLOW}Security Groups:{Style.RESET_ALL}")
-        for sg in resource_groups['security_group']:
-            print(f"\n  {Fore.WHITE}• Security Group: {sg['identifier']}{Style.RESET_ALL}")
-            print(f"    Name: {sg['name']}")
-            print(f"    Description: {sg['description']}")
-            print(f"    VPC: {sg['vpc_id']}")
-
-            # Print current rules
-            if 'current_rules' in sg:
-                print("\n    Current Inbound Rules:")
-                for rule in sg['current_rules']['inbound']:
-                    protocol = rule.get('IpProtocol', 'All')
-                    from_port = rule.get('FromPort', 'All')
-                    to_port = rule.get('ToPort', 'All')
-                    sources = []
-                    for ip_range in rule.get('IpRanges', []):
-                        sources.append(ip_range.get('CidrIp', 'Unknown'))
-                    print(f"      - {protocol} {from_port}-{to_port} from {', '.join(sources)}")
-
-                print("\n    Current Outbound Rules:")
-                for rule in sg['current_rules']['outbound']:
-                    protocol = rule.get('IpProtocol', 'All')
-                    from_port = rule.get('FromPort', 'All')
-                    to_port = rule.get('ToPort', 'All')
-                    destinations = []
-                    for ip_range in rule.get('IpRanges', []):
-                        destinations.append(ip_range.get('CidrIp', 'Unknown'))
-                    print(f"      - {protocol} {from_port}-{to_port} to {', '.join(destinations)}")
-
-            if sg['changes']:
-                print(f"\n    Changes detected:")
-                for change in sg['changes']:
-                    print(f"\n    [{change['timestamp']}]")
-                    print(f"    Modified by: {change['user']}")
-                    for change_type, desc in change['changes'].items():
-                        print(f"      - {change_type}: {desc}")
-
-    # Print Subnets
-    if resource_groups['subnet']:
-        print(f"\n{Fore.GREEN}Subnets:{Style.RESET_ALL}")
-        for subnet in resource_groups['subnet']:
-            print(f"\n  {Fore.WHITE}• Subnet: {subnet['identifier']}{Style.RESET_ALL}")
-            print(f"    CIDR Block: {subnet['cidr']}")
-            print(f"    VPC: {subnet['vpc_id']}")
-            print(f"    Availability Zone: {subnet['az']}")
-            print(f"    Auto-assign Public IP: {'Yes' if subnet['public_ip_on_launch'] else 'No'}")
-            print(f"    Available IP Addresses: {subnet['available_ips']}")
-
-            # Print route tables
-            if subnet.get('route_tables'):
-                print("\n    Route Tables:")
-                for rt in subnet['route_tables']:
-                    print(f"      Route Table: {rt['RouteTableId']}")
-                    for route in rt.get('Routes', []):
-                        destination = route.get('DestinationCidrBlock', 'Unknown')
-                        target = route.get('GatewayId', route.get('NatGatewayId', 'Unknown'))
-                        print(f"        - {destination} -> {target}")
-
-            if subnet['changes']:
-                print(f"\n    Changes detected:")
-                for change in subnet['changes']:
-                    print(f"\n    [{change['timestamp']}]")
-                    print(f"    Modified by: {change['user']}")
-                    for change_type, desc in change['changes'].items():
-                        print(f"      - {change_type}: {desc}")
-
-    # Group resources by type
-    resource_groups = {
-        'security_group': [],
-        'subnet': [],
-        'iam_role': []
-    }
-
-    for resource in resources:
-        if resource['type'] in resource_groups:
-            resource_groups[resource['type']].append(resource)
-
-    # Print Security Groups
-    if resource_groups['security_group']:
-        print(f"\n{Fore.YELLOW}Security Groups:{Style.RESET_ALL}")
-        for sg in resource_groups['security_group']:
-            print(f"\n  {Fore.WHITE}• {sg['identifier']}{Style.RESET_ALL}")
-            print(f"    Name: {sg['name']}")
-            print(f"    Description: {sg['description']}")
-            print(f"    VPC: {sg['vpc_id']}")
-
-            if sg['changes']:
-                print(f"\n    Changes detected:")
-                for change in sg['changes']:
-                    print(f"\n    [{change['timestamp']}]")
-                    print(f"    Modified by: {change['user']}")
-                    for change_type, desc in change['changes'].items():
-                        print(f"      - {change_type}: {desc}")
-
-    # Print Subnets
-    if resource_groups['subnet']:
-        print(f"\n{Fore.YELLOW}Subnets:{Style.RESET_ALL}")
-        for subnet in resource_groups['subnet']:
-            print(f"\n  {Fore.WHITE}• {subnet['identifier']}{Style.RESET_ALL}")
-            print(f"    CIDR: {subnet['cidr']}")
-            print(f"    VPC: {subnet['vpc_id']}")
-            print(f"    Availability Zone: {subnet['az']}")
-
-            if subnet['changes']:
-                print(f"\n    Changes detected:")
-                for change in subnet['changes']:
-                    print(f"\n    [{change['timestamp']}]")
-                    print(f"    Modified by: {change['user']}")
-                    for change_type, desc in change['changes'].items():
-                        print(f"      - {change_type}: {desc}")
-
-    # Print IAM Roles
-    if resource_groups['iam_role']:
-        print(f"\n{Fore.YELLOW}IAM Role:{Style.RESET_ALL}")
-        for role in resource_groups['iam_role']:
-            print(f"\n  {Fore.WHITE}• {role['identifier']}{Style.RESET_ALL}")
-            if role['changes']:
-                print(f"\n    Changes detected:")
-                for change in role['changes']:
-                    print(f"\n    [{change['timestamp']}]")
-                    print(f"    Modified by: {change['user']}")
-                    for change_type, desc in change['changes'].items():
-                        print(f"      - {change_type}: {desc}")
+                        color = AWSResourceMonitor.CHANGE_TYPE_COLORS.get(change_type, Fore.WHITE)
+                        print(f"      {color}• {change_type}: {desc}{Style.RESET_ALL}")
 
 
 def main():
@@ -630,41 +511,37 @@ def main():
     args = parser.parse_args()
 
     try:
-        # Initialize the monitor
         monitor = AWSResourceMonitor(
             resource_identifier=args.resource,
             days=args.d,
             include_related=args.include_related
         )
 
-        # Get the analysis report
         report = monitor.analyze()
 
         # Print main header
         print(format_resource_header(f"Analysis Report for {args.resource}\nTime period: Last {args.d} days"))
 
-        # Print resource-specific details
-        if report['resource_type'] == 'lambda' and 'lambda_details' in report:
-            print_lambda_details(report['lambda_details'])
+        # Print Lambda details
+        print_lambda_details(report['lambda_details'])
 
         # Print direct changes
         print(f"\n{Fore.GREEN}Direct Resource Changes:{Style.RESET_ALL}")
         if not report['changes']:
-            print(f"\n{Fore.YELLOW}No changes detected in the {report['resource_type']}{Style.RESET_ALL}")
+            print(f"\n{Fore.YELLOW}No changes detected in the Lambda function{Style.RESET_ALL}")
         else:
             print_changes(report['changes'], report['resource_type'])
 
-        # Print related resources if included and available
-        if args.include_related and report.get('related_resources'):
-            print(f"\n{Fore.GREEN}Related Resources:{Style.RESET_ALL}")
+        # Print related resources
+        if args.include_related:
+            print(f"\n{Fore.GREEN}Network Configuration and Related Resources:{Style.RESET_ALL}")
             print_related_resources(report['related_resources'])
 
         print(f"\n{format_resource_header('End of Report')}")
 
     except Exception as e:
         logger.error(f"{Fore.RED}Error analyzing resource: {e}{Style.RESET_ALL}")
-        logger.debug("Exception details:", exc_info=True)
-        sys.exit(1)
+        raise
 
 
 if __name__ == "__main__":
