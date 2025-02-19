@@ -288,7 +288,7 @@ class AWSResourceMonitor:
                 vpc_id = vpc_config.get('VpcId')
                 if vpc_id:
                     try:
-                        vpc = self.ec2_client.describe_vpc(VpcId=vpc_id)['Vpc']
+                        vpc = self.ec2_client.describe_vpcs(VpcIds=[vpc_id])['Vpcs'][0]
                         vpc_events = self._get_cloudtrail_events(vpc_id)
                         vpc_changes = self._analyze_changes(vpc_events, 'vpc')
 
@@ -379,7 +379,6 @@ class AWSResourceMonitor:
         except ClientError as e:
             logger.error(f"Error getting related resources: {e}")
             return []
-
     def analyze(self) -> Dict:
         """
         Main analysis method to detect and report changes
