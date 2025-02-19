@@ -118,20 +118,32 @@ class AWSResourceMonitor:
 
     def _get_user_info(self, event: Dict) -> str:
         """Extract meaningful user information from the event"""
-        user_identity = event.get('UserIdentity', {})
+        if not isinstance(event, dict):
+            return "Unknown User"
 
+        user_identity = event.get('UserIdentity', {})
+        if not isinstance(user_identity, dict):
+            return "Unknown User"
+
+        # Handle session context
         if 'sessionContext' in user_identity:
             session_context = user_identity['sessionContext']
-            if 'sessionIssuer' in session_context:
-                return f"{session_context['sessionIssuer'].get('userName', 'Unknown')} via {user_identity.get('type', 'Unknown')}"
+            if isinstance(session_context, dict) and 'sessionIssuer' in session_context:
+                issuer = session_context['sessionIssuer']
+                if isinstance(issuer, dict):
+                    return f"{issuer.get('userName', 'Unknown')} via {user_identity.get('type', 'Unknown')}"
 
-        identity_types = {
-            'IAMUser': lambda x: x.get('userName', 'Unknown IAM User'),
-            'AssumedRole': lambda x: f"Role: {x.get('arn', '').split('/')[-1]}",
-            'Root': lambda x: 'AWS Root User'
-        }
+        # Handle different identity types
+        identity_type = user_identity.get('type')
+        if identity_type == 'IAMUser':
+            return user_identity.get('userName', 'Unknown IAM User')
+        elif identity_type == 'AssumedRole':
+            arn = user_identity.get('arn', '')
+            return f"Role: {arn.split('/')[-1] if '/' in arn else arn}"
+        elif identity_type == 'Root':
+            return 'AWS Root User'
 
-        return identity_types.get(user_identity.get('type'), lambda x: x.get('userName', 'Unknown'))(user_identity)
+        return user_identity.get('userName', 'Unknown')
 
     def _get_cloudtrail_events(self, resource_id: Optional[str] = None) -> List[Dict]:
         """Retrieve CloudTrail events for the resource with improved lookup"""
@@ -215,29 +227,41 @@ class AWSResourceMonitor:
 
         for event in events:
             try:
+                # Ensure event is a dictionary
+                if not isinstance(event, dict):
+                    logger.warning(f"Skipping invalid event format: {event}")
+                    continue
+
+                # Extract basic event information
                 user = self._get_user_info(event)
-                event_detail = json.loads(event.get('CloudTrailEvent', '{}'))
+
+                # Parse CloudTrail event JSON
+                if isinstance(event.get('CloudTrailEvent'), str):
+                    event_detail = json.loads(event.get('CloudTrailEvent', '{}'))
+                else:
+                    event_detail = event.get('CloudTrailEvent', {})
+
                 request_params = event_detail.get('requestParameters', {})
                 response_elements = event_detail.get('responseElements', {})
 
                 change = {
-                    'timestamp': event['EventTime'],
+                    'timestamp': event.get('EventTime'),
                     'user': user,
-                    'event_type': event['EventName'],
-                    'event_source': event['EventSource'],
+                    'event_type': event.get('EventName'),
+                    'event_source': event.get('EventSource'),
                     'changes': {}
                 }
 
                 # Get changes based on resource type
                 if resource_type == 'security_group':
-                    change['changes'] = self._analyze_security_group_changes(event)
+                    change['changes'] = self._analyze_security_group_changes(event_detail)
                 elif resource_type == 'subnet':
-                    change['changes'] = self._analyze_subnet_changes(event)
+                    change['changes'] = self._analyze_subnet_changes(event_detail)
                 elif resource_type == 'iam_role':
-                    change['changes'] = self._analyze_iam_changes(event)
+                    change['changes'] = self._analyze_iam_changes(event_detail)
                 else:
                     change['changes'] = self._extract_meaningful_changes(
-                        event['EventName'],
+                        event.get('EventName', ''),
                         request_params,
                         response_elements
                     )
@@ -292,97 +316,106 @@ class AWSResourceMonitor:
             )
 
         return '; '.join(formatted)
+
     def _analyze_security_group_changes(self, event: Dict) -> Dict:
-        """Enhanced analysis of security group specific changes"""
+        """Analyze security group specific changes"""
+        if not isinstance(event, dict):
+            return {}
+
         changes = {}
+        request_params = event.get('requestParameters', {})
 
         try:
-            event_detail = json.loads(event.get('CloudTrailEvent', '{}'))
-            request_params = event_detail.get('requestParameters', {})
+            event_name = event.get('eventName', '')
 
-            event_handlers = {
-                'AuthorizeSecurityGroupIngress': (
-                    'rules',
-                    lambda p: f"Added {len(p.get('ipPermissions', []))} new inbound rules: " +
-                              self._format_ip_permissions(p.get('ipPermissions', []))
-                ),
-                'AuthorizeSecurityGroupEgress': (
-                    'rules',
-                    lambda p: f"Added {len(p.get('ipPermissions', []))} new outbound rules: " +
-                              self._format_ip_permissions(p.get('ipPermissions', []))
-                ),
-                'RevokeSecurityGroupIngress': (
-                    'rules',
-                    lambda p: f"Removed {len(p.get('ipPermissions', []))} inbound rules: " +
-                              self._format_ip_permissions(p.get('ipPermissions', []))
-                ),
-                'RevokeSecurityGroupEgress': (
-                    'rules',
-                    lambda p: f"Removed {len(p.get('ipPermissions', []))} outbound rules: " +
-                              self._format_ip_permissions(p.get('ipPermissions', []))
-                )
-            }
+            # Handle inbound rules
+            if 'AuthorizeSecurityGroupIngress' in event_name:
+                ip_permissions = request_params.get('ipPermissions', [])
+                if ip_permissions:
+                    changes['rules'] = f"Added {len(ip_permissions)} inbound rules"
 
-            for event_type, (change_key, change_handler) in event_handlers.items():
-                if event_type in event['EventName']:
-                    if callable(change_handler):
-                        changes[change_key] = change_handler(request_params)
-                    else:
-                        changes[change_key] = change_handler
+            # Handle outbound rules
+            elif 'AuthorizeSecurityGroupEgress' in event_name:
+                ip_permissions = request_params.get('ipPermissions', [])
+                if ip_permissions:
+                    changes['rules'] = f"Added {len(ip_permissions)} outbound rules"
 
-        except json.JSONDecodeError:
-            logger.warning("Could not parse CloudTrail event JSON")
+            # Handle rule removals
+            elif 'RevokeSecurityGroupIngress' in event_name:
+                ip_permissions = request_params.get('ipPermissions', [])
+                if ip_permissions:
+                    changes['rules'] = f"Removed {len(ip_permissions)} inbound rules"
+
+            elif 'RevokeSecurityGroupEgress' in event_name:
+                ip_permissions = request_params.get('ipPermissions', [])
+                if ip_permissions:
+                    changes['rules'] = f"Removed {len(ip_permissions)} outbound rules"
+
+        except Exception as e:
+            logger.warning(f"Error analyzing security group changes: {e}")
 
         return changes
 
     def _analyze_subnet_changes(self, event: Dict) -> Dict:
-        """Enhanced analysis of subnet specific changes"""
+        """Analyze subnet specific changes"""
+        if not isinstance(event, dict):
+            return {}
+
         changes = {}
+        request_params = event.get('requestParameters', {})
 
         try:
-            event_detail = json.loads(event.get('CloudTrailEvent', '{}'))
-            request_params = event_detail.get('requestParameters', {})
+            event_name = event.get('eventName', '')
 
-            if 'ModifySubnetAttribute' in event['EventName']:
-                for attr, value in request_params.items():
-                    if attr != 'subnetId':
-                        changes['attribute'] = f"Modified {attr}: {value}"
+            if 'ModifySubnetAttribute' in event_name:
+                if 'mapPublicIpOnLaunch' in request_params:
+                    value = request_params.get('mapPublicIpOnLaunch', {}).get('value', 'unknown')
+                    changes['attribute'] = f"Auto-assign public IP set to: {value}"
 
-            elif 'CreateRoute' in event['EventName']:
+            elif 'CreateRoute' in event_name:
                 dest_cidr = request_params.get('destinationCidrBlock', 'unknown')
-                target = next((v for k, v in request_params.items() if 'target' in k.lower()), 'unknown')
-                changes['routing'] = f"Added route to {dest_cidr} via {target}"
+                changes['routing'] = f"Added route to {dest_cidr}"
 
-            elif 'DeleteRoute' in event['EventName']:
+            elif 'DeleteRoute' in event_name:
                 dest_cidr = request_params.get('destinationCidrBlock', 'unknown')
                 changes['routing'] = f"Removed route to {dest_cidr}"
 
-        except json.JSONDecodeError:
-            logger.warning("Could not parse CloudTrail event JSON")
+        except Exception as e:
+            logger.warning(f"Error analyzing subnet changes: {e}")
 
         return changes
 
     def _analyze_iam_changes(self, event: Dict) -> Dict:
         """Analyze IAM specific changes"""
-        event_handlers = {
-            'PutRolePolicy': lambda p: f"Added/Updated inline policy: {p.get('policyName', 'unknown')}",
-            'DeleteRolePolicy': lambda p: f"Removed inline policy: {p.get('policyName', 'unknown')}",
-            'AttachRolePolicy': lambda p: f"Attached managed policy: {p.get('policyArn', 'unknown')}",
-            'DetachRolePolicy': lambda p: f"Detached managed policy: {p.get('policyArn', 'unknown')}"
-        }
+        if not isinstance(event, dict):
+            return {}
+
+        changes = {}
+        request_params = event.get('requestParameters', {})
 
         try:
-            event_detail = json.loads(event.get('CloudTrailEvent', '{}'))
-            request_params = event_detail.get('requestParameters', {})
+            event_name = event.get('eventName', '')
 
-            for event_type, handler in event_handlers.items():
-                if event_type in event['EventName']:
-                    return {'policy': handler(request_params)}
+            if 'PutRolePolicy' in event_name:
+                policy_name = request_params.get('policyName', 'unknown')
+                changes['policy'] = f"Added/Updated inline policy: {policy_name}"
 
-        except json.JSONDecodeError:
-            logger.warning("Could not parse CloudTrail event JSON")
+            elif 'DeleteRolePolicy' in event_name:
+                policy_name = request_params.get('policyName', 'unknown')
+                changes['policy'] = f"Removed inline policy: {policy_name}"
 
-        return {}
+            elif 'AttachRolePolicy' in event_name:
+                policy_arn = request_params.get('policyArn', 'unknown')
+                changes['policy'] = f"Attached managed policy: {policy_arn}"
+
+            elif 'DetachRolePolicy' in event_name:
+                policy_arn = request_params.get('policyArn', 'unknown')
+                changes['policy'] = f"Detached managed policy: {policy_arn}"
+
+        except Exception as e:
+            logger.warning(f"Error analyzing IAM changes: {e}")
+
+        return changes
 
     def _get_related_resources(self) -> List[Dict]:
         """Get related resources and their changes with enhanced details"""
