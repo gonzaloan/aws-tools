@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 import json
+import sys
 import boto3
 import logging
 import argparse
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 from botocore.exceptions import ClientError
 from colorama import init, Fore, Style
 
@@ -336,234 +337,207 @@ class AWSResourceMonitor:
 
             return related_resources
 
-
         except ClientError as e:
+            logger.error(f"Error getting related resources: {e}")
+            return []
 
-            logger.error(f"Error analyzing Lambda function: {e}")
+    def analyze(self) -> Dict:
+        """
+        Main analysis method to detect and report changes
+        """
+        try:
+            # Get resource type and basic info
+            resource_type = self._get_resource_type()
+            resource_arn = self._get_resource_arn()
 
+            # Initialize the basic report structure
+            report = {
+                'resource_identifier': self.resource_identifier,
+                'resource_type': resource_type,
+                'analysis_period_days': self.days,
+                'analysis_time': datetime.utcnow().isoformat(),
+                'changes': [],
+                'related_resources': []
+            }
+
+            # Get main resource changes
+            events = self._get_cloudtrail_events()
+            report['changes'] = self._analyze_changes(events, resource_type)
+
+            # Handle Lambda-specific details
+            if resource_type == 'lambda':
+                try:
+                    function = self.lambda_client.get_function(FunctionName=self.resource_identifier)
+                    config = function['Configuration']
+
+                    report['lambda_details'] = {
+                        'runtime': config.get('Runtime', 'Unknown'),
+                        'memory': config.get('MemorySize', 'Unknown'),
+                        'timeout': config.get('Timeout', 'Unknown'),
+                        'handler': config.get('Handler', 'Unknown'),
+                        'last_modified': config.get('LastModified', 'Unknown')
+                    }
+
+                    # Get related resources if requested
+                    if self.include_related:
+                        report['related_resources'] = self._get_related_resources()
+                except ClientError as e:
+                    logger.error(f"Error getting Lambda details: {e}")
+                    report['lambda_details'] = {
+                        'error': f"Could not retrieve Lambda details: {str(e)}"
+                    }
+
+            return report
+
+        except Exception as e:
+            logger.error(f"Error analyzing resource: {e}")
             raise
 
 
 def format_resource_header(text: str) -> str:
     """Format section headers with consistent styling"""
-
     return f"{Fore.CYAN}{'=' * 80}\n{text}\n{'=' * 80}{Style.RESET_ALL}"
 
 
 def print_lambda_details(details: Dict):
     """Print Lambda function configuration details"""
-
     print(f"\n{Fore.YELLOW}Lambda Configuration:{Style.RESET_ALL}")
-
     print(f"  Runtime: {details['runtime']}")
-
     print(f"  Memory: {details['memory']} MB")
-
     print(f"  Timeout: {details['timeout']} seconds")
-
     print(f"  Handler: {details['handler']}")
-
     print(f"  Last Modified: {details['last_modified']}")
 
 
 def print_changes(changes: List[Dict], resource_type: str, indent: str = "") -> None:
     """Print changes with color formatting"""
-
     for change in changes:
-
         # Format timestamp
-
         timestamp = datetime.strptime(str(change['timestamp']), "%Y-%m-%d %H:%M:%S%z")
-
         formatted_time = timestamp.strftime("%Y-%m-%d %H:%M:%S UTC")
 
         print(f"\n{indent}{Fore.WHITE}{formatted_time}")
-
         print(f"{indent}Action: {Fore.CYAN}{change['event_type']}{Style.RESET_ALL}")
-
         print(f"{indent}By: {Fore.YELLOW}{change['user']}{Style.RESET_ALL}")
 
         if change.get('changes'):
-
             print(f"{indent}Changes detected:")
-
             for change_type, change_desc in change['changes'].items():
                 color = AWSResourceMonitor.CHANGE_TYPE_COLORS.get(change_type, Fore.WHITE)
-
                 print(f"{indent}  - {color}{change_type}: {change_desc}{Style.RESET_ALL}")
 
 
 def print_related_resources(resources: List[Dict]):
     """Print related resources information"""
-
     if not resources:
         print(f"\n{Fore.YELLOW}No related resources found{Style.RESET_ALL}")
-
         return
 
     # Group resources by type
-
     resource_groups = {
-
         'security_group': [],
-
         'subnet': [],
-
         'iam_role': []
-
     }
 
     for resource in resources:
-
         if resource['type'] in resource_groups:
             resource_groups[resource['type']].append(resource)
 
     # Print Security Groups
-
     if resource_groups['security_group']:
-
         print(f"\n{Fore.YELLOW}Security Groups:{Style.RESET_ALL}")
-
         for sg in resource_groups['security_group']:
-
             print(f"\n  {Fore.WHITE}• {sg['identifier']}{Style.RESET_ALL}")
-
             print(f"    Name: {sg['name']}")
-
             print(f"    Description: {sg['description']}")
-
             print(f"    VPC: {sg['vpc_id']}")
 
             if sg['changes']:
-
                 print(f"\n    Changes detected:")
-
                 for change in sg['changes']:
-
                     print(f"\n    [{change['timestamp']}]")
-
                     print(f"    Modified by: {change['user']}")
-
                     for change_type, desc in change['changes'].items():
                         print(f"      - {change_type}: {desc}")
 
     # Print Subnets
-
     if resource_groups['subnet']:
-
         print(f"\n{Fore.YELLOW}Subnets:{Style.RESET_ALL}")
-
         for subnet in resource_groups['subnet']:
-
             print(f"\n  {Fore.WHITE}• {subnet['identifier']}{Style.RESET_ALL}")
-
             print(f"    CIDR: {subnet['cidr']}")
-
             print(f"    VPC: {subnet['vpc_id']}")
-
             print(f"    Availability Zone: {subnet['az']}")
 
             if subnet['changes']:
-
                 print(f"\n    Changes detected:")
-
                 for change in subnet['changes']:
-
                     print(f"\n    [{change['timestamp']}]")
-
                     print(f"    Modified by: {change['user']}")
-
                     for change_type, desc in change['changes'].items():
                         print(f"      - {change_type}: {desc}")
 
     # Print IAM Roles
-
     if resource_groups['iam_role']:
-
         print(f"\n{Fore.YELLOW}IAM Role:{Style.RESET_ALL}")
-
         for role in resource_groups['iam_role']:
-
             print(f"\n  {Fore.WHITE}• {role['identifier']}{Style.RESET_ALL}")
-
             if role['changes']:
-
                 print(f"\n    Changes detected:")
-
                 for change in role['changes']:
-
                     print(f"\n    [{change['timestamp']}]")
-
                     print(f"    Modified by: {change['user']}")
-
                     for change_type, desc in change['changes'].items():
                         print(f"      - {change_type}: {desc}")
 
 
 def main():
     """Main function to run the AWS Resource Monitor"""
-
     parser = argparse.ArgumentParser(description='Monitor AWS resource changes')
-
     parser.add_argument('--resource', required=True, help='Resource ARN or name')
-
     parser.add_argument('--d', type=int, default=7, help='Number of days to look back')
-
     parser.add_argument('--include-related', action='store_true',
-
                         help='Include related resource changes')
 
     args = parser.parse_args()
 
     try:
-
+        # Initialize the monitor
         monitor = AWSResourceMonitor(
-
             resource_identifier=args.resource,
-
             days=args.d,
-
             include_related=args.include_related
-
         )
 
+        # Get the analysis report
         report = monitor.analyze()
 
         # Print main header
-
         print(format_resource_header(f"Analysis Report for {args.resource}\nTime period: Last {args.d} days"))
 
-        # Print Lambda details
-
-        print_lambda_details(report['lambda_details'])
+        # Print resource-specific details
+        if report['resource_type'] == 'lambda' and 'lambda_details' in report:
+            print_lambda_details(report['lambda_details'])
 
         # Print direct changes
-
         print(f"\n{Fore.GREEN}Direct Resource Changes:{Style.RESET_ALL}")
-
         if not report['changes']:
-
-            print(f"\n{Fore.YELLOW}No changes detected in the Lambda function{Style.RESET_ALL}")
-
+            print(f"\n{Fore.YELLOW}No changes detected in the {report['resource_type']}{Style.RESET_ALL}")
         else:
-
             print_changes(report['changes'], report['resource_type'])
 
-        # Print related resources
-
-        if args.include_related:
-            print(f"\n{Fore.GREEN}Network Configuration and Related Resources:{Style.RESET_ALL}")
-
+        # Print related resources if included and available
+        if args.include_related and report.get('related_resources'):
+            print(f"\n{Fore.GREEN}Related Resources:{Style.RESET_ALL}")
             print_related_resources(report['related_resources'])
 
         print(f"\n{format_resource_header('End of Report')}")
 
-
     except Exception as e:
-
         logger.error(f"{Fore.RED}Error analyzing resource: {e}{Style.RESET_ALL}")
-
-        raise
+        logger.debug("Exception details:", exc_info=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
