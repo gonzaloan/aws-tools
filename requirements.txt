@@ -3,3 +3,5 @@ botocore
 colorama
 argparse
 json
+psycopg2
+pymemcache
