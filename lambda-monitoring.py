@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
+import argparse
 import json
+
 import boto3
 import logging
 from datetime import datetime, timedelta
@@ -273,20 +275,31 @@ class AWSResourceMonitor:
         """
         related_resources = []
         try:
+            logger.info(f"Getting related resources for {self.resource_identifier}")
+
             # Get Lambda configuration
             lambda_client = self.session.client('lambda')
+            logger.info("Getting Lambda configuration...")
+
             function = lambda_client.get_function(FunctionName=self.resource_identifier)
             vpc_config = function['Configuration'].get('VpcConfig', {})
+
+            logger.info(f"VPC Config found: {vpc_config}")
 
             if vpc_config:
                 # Get Security Groups changes
                 ec2_client = self.session.client('ec2')
                 if vpc_config.get('SecurityGroupIds'):
+                    logger.info(f"Found Security Groups: {vpc_config['SecurityGroupIds']}")
                     for sg_id in vpc_config['SecurityGroupIds']:
                         try:
+                            logger.info(f"Analyzing Security Group: {sg_id}")
                             # Get SG details
                             sg = ec2_client.describe_security_groups(GroupIds=[sg_id])['SecurityGroups'][0]
+                            logger.info(f"Security Group details: {sg['GroupName']}")
+
                             sg_events = self._get_resource_events(sg_id, 'security_group')
+                            logger.info(f"Found {len(sg_events)} events for SG {sg_id}")
 
                             # Analyze SG changes
                             sg_changes = []
@@ -299,6 +312,8 @@ class AWSResourceMonitor:
                                         'changes': changes
                                     })
 
+                            logger.info(f"Found {len(sg_changes)} changes for SG {sg_id}")
+
                             if sg_changes:
                                 related_resources.append({
                                     'type': 'security_group',
@@ -307,14 +322,21 @@ class AWSResourceMonitor:
                                 })
                         except ClientError as e:
                             logger.error(f"Error analyzing security group {sg_id}: {e}")
+                else:
+                    logger.info("No Security Groups found in VPC config")
 
                 # Get Subnet changes
                 if vpc_config.get('SubnetIds'):
+                    logger.info(f"Found Subnets: {vpc_config['SubnetIds']}")
                     for subnet_id in vpc_config['SubnetIds']:
                         try:
+                            logger.info(f"Analyzing Subnet: {subnet_id}")
                             # Get subnet details
                             subnet = ec2_client.describe_subnets(SubnetIds=[subnet_id])['Subnets'][0]
+                            logger.info(f"Subnet details: {subnet.get('CidrBlock')}")
+
                             subnet_events = self._get_resource_events(subnet_id, 'subnet')
+                            logger.info(f"Found {len(subnet_events)} events for Subnet {subnet_id}")
 
                             # Analyze subnet changes
                             subnet_changes = []
@@ -327,6 +349,8 @@ class AWSResourceMonitor:
                                         'changes': changes
                                     })
 
+                            logger.info(f"Found {len(subnet_changes)} changes for Subnet {subnet_id}")
+
                             if subnet_changes:
                                 vpc_id = subnet.get('VpcId', 'Unknown')
                                 cidr = subnet.get('CidrBlock', 'Unknown')
@@ -337,11 +361,18 @@ class AWSResourceMonitor:
                                 })
                         except ClientError as e:
                             logger.error(f"Error analyzing subnet {subnet_id}: {e}")
+                else:
+                    logger.info("No Subnets found in VPC config")
+            else:
+                logger.info("Lambda function is not VPC-enabled")
 
             # Get IAM Role changes
             iam_role = function['Configuration'].get('Role')
             if iam_role:
+                logger.info(f"Found IAM Role: {iam_role}")
                 role_events = self._get_resource_events(iam_role.split('/')[-1], 'role')
+                logger.info(f"Found {len(role_events)} events for Role {iam_role}")
+
                 role_changes = self._analyze_changes(role_events)
                 if role_changes:
                     related_resources.append({
@@ -349,10 +380,13 @@ class AWSResourceMonitor:
                         'identifier': iam_role,
                         'changes': role_changes
                     })
+            else:
+                logger.info("No IAM Role found")
 
         except ClientError as e:
             logger.error(f"Error getting related resources: {e}")
 
+        logger.info(f"Total related resources with changes: {len(related_resources)}")
         return related_resources
 
     def _get_resource_events(self, resource_id: str, resource_type: str) -> List[Dict]:
