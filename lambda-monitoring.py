@@ -84,7 +84,8 @@ class AWSResourceMonitor:
         return 'unknown'
 
     def _is_relevant_event(self, event: Dict) -> bool:
-        """Filter out non-relevant events"""
+        """Enhanced filter for relevant events"""
+        # Events that should always be ignored
         ignored_events = {
             'AssumeRole', 'ConsoleLogin', 'BatchGetTraces',
             'StartQueryExecution', 'GetQueryExecution', 'GetQueryResults',
@@ -95,6 +96,21 @@ class AWSResourceMonitor:
         if event['EventName'] in ignored_events:
             return False
 
+        # For security groups, include all authorization events
+        if any(keyword in event['EventName'] for keyword in [
+            'AuthorizeSecurityGroup', 'RevokeSecurityGroup',
+            'UpdateSecurityGroupRule', 'ModifySecurityGroup'
+        ]):
+            return True
+
+        # For subnets, include all modification events
+        if any(keyword in event['EventName'] for keyword in [
+            'ModifySubnet', 'CreateRoute', 'DeleteRoute',
+            'AssociateRouteTable', 'DisassociateRouteTable'
+        ]):
+            return True
+
+        # For standard read operations, ignore
         if event['EventName'].startswith(('Get', 'List', 'Describe', 'Head')):
             return False
 
@@ -118,18 +134,40 @@ class AWSResourceMonitor:
         return identity_types.get(user_identity.get('type'), lambda x: x.get('userName', 'Unknown'))(user_identity)
 
     def _get_cloudtrail_events(self, resource_id: Optional[str] = None) -> List[Dict]:
-        """Retrieve CloudTrail events for the resource"""
+        """Retrieve CloudTrail events for the resource with improved lookup"""
         try:
             events = []
             paginator = self.cloudtrail.get_paginator('lookup_events')
 
-            lookup_attributes = [{
+            # Try different lookup attributes to catch more events
+            lookup_attributes = []
+
+            # Add ResourceName lookup
+            lookup_attributes.append({
                 'AttributeKey': 'ResourceName',
                 'AttributeValue': resource_id or self.resource_identifier
-            }]
+            })
 
-            for page in paginator.paginate(StartTime=self.start_time, LookupAttributes=lookup_attributes):
-                events.extend([event for event in page.get('Events', []) if self._is_relevant_event(event)])
+            # Add ResourceId lookup
+            lookup_attributes.append({
+                'AttributeKey': 'ResourceId',
+                'AttributeValue': resource_id or self.resource_identifier
+            })
+
+            # For each lookup attribute
+            for lookup_attr in lookup_attributes:
+                try:
+                    for page in paginator.paginate(
+                            StartTime=self.start_time,
+                            LookupAttributes=[lookup_attr]
+                    ):
+                        events.extend([
+                            event for event in page.get('Events', [])
+                            if self._is_relevant_event(event)
+                        ])
+                except ClientError as e:
+                    logger.warning(f"Error with lookup attribute {lookup_attr}: {e}")
+                    continue
 
             return events
 
@@ -200,38 +238,71 @@ class AWSResourceMonitor:
 
         return changes
 
+    def _format_ip_permissions(self, permissions: List[Dict]) -> str:
+        """Format IP permissions for better readability"""
+        formatted = []
+        for perm in permissions:
+            protocol = perm.get('ipProtocol', '-1')
+            from_port = perm.get('fromPort', 'All')
+            to_port = perm.get('toPort', 'All')
+
+            ranges = []
+            for ip_range in perm.get('ipRanges', []):
+                cidr = ip_range.get('cidrIp', '')
+                desc = ip_range.get('description', '')
+                ranges.append(f"{cidr} ({desc})" if desc else cidr)
+
+            formatted.append(
+                f"Protocol: {protocol}, Ports: {from_port}-{to_port}, "
+                f"IPs: {', '.join(ranges) or 'None'}"
+            )
+
+        return '; '.join(formatted)
     def _analyze_security_group_changes(self, event: Dict) -> Dict:
-        """Analyze security group specific changes"""
-        event_handlers = {
-            'UpdateSecurityGroupRuleDescriptionsIngress': ('rules', "Inbound rules descriptions updated"),
-            'UpdateSecurityGroupRuleDescriptionsEgress': ('rules', "Outbound rules descriptions updated"),
-            'AuthorizeSecurityGroupIngress': (
-            'rules', lambda p: f"Added {len(p.get('ipPermissions', []))} new inbound rules"),
-            'AuthorizeSecurityGroupEgress': (
-            'rules', lambda p: f"Added {len(p.get('ipPermissions', []))} new outbound rules"),
-            'RevokeSecurityGroupIngress': (
-            'rules', lambda p: f"Removed {len(p.get('ipPermissions', []))} inbound rules"),
-            'RevokeSecurityGroupEgress': (
-            'rules', lambda p: f"Removed {len(p.get('ipPermissions', []))} outbound rules")
-        }
+        """Enhanced analysis of security group specific changes"""
+        changes = {}
 
         try:
             event_detail = json.loads(event.get('CloudTrailEvent', '{}'))
             request_params = event_detail.get('requestParameters', {})
 
-            for event_type, (change_key, change_value) in event_handlers.items():
+            event_handlers = {
+                'AuthorizeSecurityGroupIngress': (
+                    'rules',
+                    lambda p: f"Added {len(p.get('ipPermissions', []))} new inbound rules: " +
+                              self._format_ip_permissions(p.get('ipPermissions', []))
+                ),
+                'AuthorizeSecurityGroupEgress': (
+                    'rules',
+                    lambda p: f"Added {len(p.get('ipPermissions', []))} new outbound rules: " +
+                              self._format_ip_permissions(p.get('ipPermissions', []))
+                ),
+                'RevokeSecurityGroupIngress': (
+                    'rules',
+                    lambda p: f"Removed {len(p.get('ipPermissions', []))} inbound rules: " +
+                              self._format_ip_permissions(p.get('ipPermissions', []))
+                ),
+                'RevokeSecurityGroupEgress': (
+                    'rules',
+                    lambda p: f"Removed {len(p.get('ipPermissions', []))} outbound rules: " +
+                              self._format_ip_permissions(p.get('ipPermissions', []))
+                )
+            }
+
+            for event_type, (change_key, change_handler) in event_handlers.items():
                 if event_type in event['EventName']:
-                    if callable(change_value):
-                        return {change_key: change_value(request_params)}
-                    return {change_key: change_value}
+                    if callable(change_handler):
+                        changes[change_key] = change_handler(request_params)
+                    else:
+                        changes[change_key] = change_handler
 
         except json.JSONDecodeError:
             logger.warning("Could not parse CloudTrail event JSON")
 
-        return {}
+        return changes
 
     def _analyze_subnet_changes(self, event: Dict) -> Dict:
-        """Analyze subnet specific changes"""
+        """Enhanced analysis of subnet specific changes"""
         changes = {}
 
         try:
@@ -239,15 +310,18 @@ class AWSResourceMonitor:
             request_params = event_detail.get('requestParameters', {})
 
             if 'ModifySubnetAttribute' in event['EventName']:
-                if 'mapPublicIpOnLaunch' in request_params:
-                    value = request_params['mapPublicIpOnLaunch'].get('value', 'unknown')
-                    changes['attribute'] = f"Auto-assign public IP set to: {value}"
+                for attr, value in request_params.items():
+                    if attr != 'subnetId':
+                        changes['attribute'] = f"Modified {attr}: {value}"
 
-            elif 'CreateTags' in event['EventName']:
-                changes['tags'] = "Tags modified"
+            elif 'CreateRoute' in event['EventName']:
+                dest_cidr = request_params.get('destinationCidrBlock', 'unknown')
+                target = next((v for k, v in request_params.items() if 'target' in k.lower()), 'unknown')
+                changes['routing'] = f"Added route to {dest_cidr} via {target}"
 
-            elif 'CreateRoute' in event['EventName'] or 'DeleteRoute' in event['EventName']:
-                changes['routing'] = "Route table modified"
+            elif 'DeleteRoute' in event['EventName']:
+                dest_cidr = request_params.get('destinationCidrBlock', 'unknown')
+                changes['routing'] = f"Removed route to {dest_cidr}"
 
         except json.JSONDecodeError:
             logger.warning("Could not parse CloudTrail event JSON")
