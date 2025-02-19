@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse
+import json
 import boto3
 import logging
 from datetime import datetime, timedelta
@@ -9,6 +9,10 @@ from colorama import init, Fore, Style
 
 # Initialize colorama
 init(autoreset=True)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -207,39 +211,145 @@ class AWSResourceMonitor:
 
         return changes
 
+    def _analyze_security_group_changes(self, event: Dict) -> Dict:
+        """
+        Analyze security group specific changes
+        """
+        changes = {}
+        try:
+            event_detail = json.loads(event.get('CloudTrailEvent', '{}'))
+            request_params = event_detail.get('requestParameters', {})
+
+            if 'UpdateSecurityGroupRuleDescriptionsIngress' in event['EventName']:
+                changes['rules'] = "Inbound rules descriptions updated"
+            elif 'UpdateSecurityGroupRuleDescriptionsEgress' in event['EventName']:
+                changes['rules'] = "Outbound rules descriptions updated"
+            elif 'AuthorizeSecurityGroupIngress' in event['EventName']:
+                rules = request_params.get('ipPermissions', [])
+                changes['rules'] = f"Added {len(rules)} new inbound rules"
+            elif 'AuthorizeSecurityGroupEgress' in event['EventName']:
+                rules = request_params.get('ipPermissions', [])
+                changes['rules'] = f"Added {len(rules)} new outbound rules"
+            elif 'RevokeSecurityGroupIngress' in event['EventName']:
+                rules = request_params.get('ipPermissions', [])
+                changes['rules'] = f"Removed {len(rules)} inbound rules"
+            elif 'RevokeSecurityGroupEgress' in event['EventName']:
+                rules = request_params.get('ipPermissions', [])
+                changes['rules'] = f"Removed {len(rules)} outbound rules"
+
+        except json.JSONDecodeError:
+            logger.warning("Could not parse CloudTrail event JSON")
+
+        return changes
+
+    def _analyze_subnet_changes(self, event: Dict) -> Dict:
+        """
+        Analyze subnet specific changes
+        """
+        changes = {}
+        try:
+            event_detail = json.loads(event.get('CloudTrailEvent', '{}'))
+            request_params = event_detail.get('requestParameters', {})
+
+            if 'ModifySubnetAttribute' in event['EventName']:
+                if 'mapPublicIpOnLaunch' in request_params:
+                    value = request_params['mapPublicIpOnLaunch'].get('value', 'unknown')
+                    changes['attribute'] = f"Auto-assign public IP set to: {value}"
+
+            elif 'CreateTags' in event['EventName']:
+                changes['tags'] = "Tags modified"
+
+            elif 'CreateRoute' in event['EventName'] or 'DeleteRoute' in event['EventName']:
+                changes['routing'] = "Route table modified"
+
+        except json.JSONDecodeError:
+            logger.warning("Could not parse CloudTrail event JSON")
+
+        return changes
+
     def _get_related_resources(self) -> List[Dict]:
         """
         Get related resources and their changes
         """
         related_resources = []
         try:
-            # For Lambda, get VPC configuration
+            # Get Lambda configuration
             lambda_client = self.session.client('lambda')
             function = lambda_client.get_function(FunctionName=self.resource_identifier)
             vpc_config = function['Configuration'].get('VpcConfig', {})
 
             if vpc_config:
                 # Get Security Groups changes
+                ec2_client = self.session.client('ec2')
                 if vpc_config.get('SecurityGroupIds'):
                     for sg_id in vpc_config['SecurityGroupIds']:
-                        sg_events = self._get_resource_events(sg_id, 'security_group')
-                        if sg_events:
-                            related_resources.append({
-                                'type': 'security_group',
-                                'identifier': sg_id,
-                                'changes': self._analyze_changes(sg_events)
-                            })
+                        try:
+                            # Get SG details
+                            sg = ec2_client.describe_security_groups(GroupIds=[sg_id])['SecurityGroups'][0]
+                            sg_events = self._get_resource_events(sg_id, 'security_group')
+
+                            # Analyze SG changes
+                            sg_changes = []
+                            for event in sg_events:
+                                if changes := self._analyze_security_group_changes(event):
+                                    sg_changes.append({
+                                        'timestamp': event['EventTime'],
+                                        'user': self._get_user_info(event),
+                                        'event_type': event['EventName'],
+                                        'changes': changes
+                                    })
+
+                            if sg_changes:
+                                related_resources.append({
+                                    'type': 'security_group',
+                                    'identifier': f"{sg_id} ({sg.get('GroupName', 'Unknown')})",
+                                    'changes': sg_changes
+                                })
+                        except ClientError as e:
+                            logger.error(f"Error analyzing security group {sg_id}: {e}")
 
                 # Get Subnet changes
                 if vpc_config.get('SubnetIds'):
                     for subnet_id in vpc_config['SubnetIds']:
-                        subnet_events = self._get_resource_events(subnet_id, 'subnet')
-                        if subnet_events:
-                            related_resources.append({
-                                'type': 'subnet',
-                                'identifier': subnet_id,
-                                'changes': self._analyze_changes(subnet_events)
-                            })
+                        try:
+                            # Get subnet details
+                            subnet = ec2_client.describe_subnets(SubnetIds=[subnet_id])['Subnets'][0]
+                            subnet_events = self._get_resource_events(subnet_id, 'subnet')
+
+                            # Analyze subnet changes
+                            subnet_changes = []
+                            for event in subnet_events:
+                                if changes := self._analyze_subnet_changes(event):
+                                    subnet_changes.append({
+                                        'timestamp': event['EventTime'],
+                                        'user': self._get_user_info(event),
+                                        'event_type': event['EventName'],
+                                        'changes': changes
+                                    })
+
+                            if subnet_changes:
+                                vpc_id = subnet.get('VpcId', 'Unknown')
+                                cidr = subnet.get('CidrBlock', 'Unknown')
+                                related_resources.append({
+                                    'type': 'subnet',
+                                    'identifier': f"{subnet_id} (CIDR: {cidr}, VPC: {vpc_id})",
+                                    'changes': subnet_changes
+                                })
+                        except ClientError as e:
+                            logger.error(f"Error analyzing subnet {subnet_id}: {e}")
+
+            # Get IAM Role changes
+            iam_role = function['Configuration'].get('Role')
+            if iam_role:
+                role_events = self._get_resource_events(iam_role.split('/')[-1], 'role')
+                role_changes = self._analyze_changes(role_events)
+                if role_changes:
+                    related_resources.append({
+                        'type': 'iam_role',
+                        'identifier': iam_role,
+                        'changes': role_changes
+                    })
+
         except ClientError as e:
             logger.error(f"Error getting related resources: {e}")
 
