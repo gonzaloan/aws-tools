@@ -6,36 +6,9 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from botocore.exceptions import ClientError
 
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-def _analyze_changes(events: List[Dict]) -> List[Dict]:
-    """
-    Analyze the changes from CloudTrail events
-    """
-    changes = []
-    for event in events:
-        try:
-            change = {
-                'timestamp': event['EventTime'],
-                'user': event.get('Username', 'Unknown'),
-                'event_type': event['EventName'],
-                'event_source': event['EventSource'],
-                'resources': event.get('Resources', []),
-            }
-
-            # Parse the CloudTrail event for before/after states
-            if 'CloudTrailEvent' in event:
-                # TODO: Implement detailed change analysis
-                pass
-
-            changes.append(change)
-        except KeyError as e:
-            logger.warning(f"Skipping malformed event: {e}")
-            continue
-
-    return changes
 
 
 class AWSResourceMonitor:
@@ -70,6 +43,57 @@ class AWSResourceMonitor:
         # Add more resource type detection logic
         return 'unknown'
 
+    def _is_relevant_event(self, event: Dict) -> bool:
+        """
+        Filter out non-relevant events
+        """
+        # List of events to ignore
+        ignored_events = {
+            'AssumeRole',
+            'ConsoleLogin',
+            'BatchGetTraces',
+            'StartQueryExecution',
+            'GetQueryExecution',
+            'GetQueryResults',
+            'ListTags',
+            'GetFunction',  # Ignore read-only operations
+            'DescribeFunction',
+            'GetPolicy',
+            'GetRolePolicy'
+        }
+
+        if event['EventName'] in ignored_events:
+            return False
+
+        # Ignore read-only API calls (usually start with 'Get', 'List', 'Describe')
+        if event['EventName'].startswith(('Get', 'List', 'Describe', 'Head')):
+            return False
+
+        return True
+
+    def _get_user_info(self, event: Dict) -> str:
+        """
+        Extract meaningful user information from the event
+        """
+        user_identity = event.get('UserIdentity', {})
+
+        # Try to get the most meaningful user identifier
+        if 'sessionContext' in user_identity:
+            session_context = user_identity['sessionContext']
+            if 'sessionIssuer' in session_context:
+                return f"{session_context['sessionIssuer'].get('userName', 'Unknown')} via {user_identity.get('type', 'Unknown')}"
+
+        # Check for different types of identities
+        if user_identity.get('type') == 'IAMUser':
+            return user_identity.get('userName', 'Unknown IAM User')
+        elif user_identity.get('type') == 'AssumedRole':
+            role_info = user_identity.get('arn', '').split('/')
+            return f"Role: {role_info[-1] if len(role_info) > 1 else 'Unknown Role'}"
+        elif user_identity.get('type') == 'Root':
+            return 'AWS Root User'
+
+        return user_identity.get('userName', 'Unknown')
+
     def _get_cloudtrail_events(self) -> List[Dict]:
         """
         Retrieve CloudTrail events for the resource
@@ -85,12 +109,83 @@ class AWSResourceMonitor:
                         'AttributeValue': self.resource_identifier
                     }]
             ):
-                events.extend(page.get('Events', []))
+                for event in page.get('Events', []):
+                    if self._is_relevant_event(event):
+                        events.append(event)
 
             return events
         except ClientError as e:
             logger.error(f"Error retrieving CloudTrail events: {e}")
             return []
+
+    def _analyze_changes(self, events: List[Dict]) -> List[Dict]:
+        """
+        Analyze the changes from CloudTrail events
+        """
+        changes = []
+        for event in events:
+            try:
+                # Get meaningful user information
+                user = self._get_user_info(event)
+
+                # Extract request parameters and response elements
+                event_detail = event.get('CloudTrailEvent', {})
+                if isinstance(event_detail, str):
+                    import json
+                    event_detail = json.loads(event_detail)
+
+                request_params = event_detail.get('requestParameters', {})
+                response_elements = event_detail.get('responseElements', {})
+
+                # Create base change object
+                change = {
+                    'timestamp': event['EventTime'],
+                    'user': user,
+                    'event_type': event['EventName'],
+                    'event_source': event['EventSource'],
+                    'changes': self._extract_meaningful_changes(
+                        event['EventName'],
+                        request_params,
+                        response_elements
+                    )
+                }
+
+                # Only add changes that have meaningful information
+                if change['changes']:
+                    changes.append(change)
+
+            except KeyError as e:
+                logger.warning(f"Skipping malformed event: {e}")
+                continue
+
+        return changes
+
+    def _extract_meaningful_changes(self, event_name: str, request_params: Dict, response_elements: Dict) -> Dict:
+        """
+        Extract meaningful changes based on the event type
+        """
+        changes = {}
+
+        # Handle Lambda specific changes
+        if 'UpdateFunctionConfiguration' in event_name:
+            if 'memorySize' in request_params:
+                changes['memory'] = f"Changed to {request_params['memorySize']}MB"
+            if 'timeout' in request_params:
+                changes['timeout'] = f"Changed to {request_params['timeout']}s"
+            if 'environment' in request_params:
+                changes['environment'] = "Environment variables modified"
+
+        elif 'UpdateFunctionCode' in event_name:
+            changes['code'] = "Function code updated"
+            if 'revisionId' in response_elements:
+                changes['revision'] = f"New revision: {response_elements['revisionId']}"
+
+        elif 'AddPermission' in event_name or 'RemovePermission' in event_name:
+            changes['permissions'] = "Function permissions modified"
+
+        # Add more event types as needed
+
+        return changes
 
     def analyze(self) -> Dict:
         """
@@ -101,7 +196,7 @@ class AWSResourceMonitor:
 
         # Get main resource changes
         events = self._get_cloudtrail_events()
-        changes = _analyze_changes(events)
+        changes = self._analyze_changes(events)
 
         # Initialize the report
         report = {
@@ -137,12 +232,19 @@ def main():
 
         report = monitor.analyze()
 
-        # TODO: Implement better report formatting
-        print(f"Changes for {args.resource} in the last {args.d} days:")
-        for change in report['changes']:
-            print(f"\n{change['timestamp']} - {change['event_type']}")
-            print(f"By: {change['user']}")
-            print(f"Source: {change['event_source']}")
+        print(f"\nChanges for {args.resource} in the last {args.d} days:")
+        if not report['changes']:
+            print("\nNo significant changes detected.")
+        else:
+            for change in report['changes']:
+                print(f"\n[{change['timestamp']}]")
+                print(f"Action: {change['event_type']}")
+                print(f"By: {change['user']}")
+
+                if change.get('changes'):
+                    print("Changes detected:")
+                    for change_type, change_desc in change['changes'].items():
+                        print(f"  - {change_type}: {change_desc}")
 
     except Exception as e:
         logger.error(f"Error analyzing resource: {e}")
