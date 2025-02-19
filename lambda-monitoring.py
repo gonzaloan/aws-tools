@@ -5,6 +5,10 @@ import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from botocore.exceptions import ClientError
+from colorama import init, Fore, Style
+
+# Initialize colorama
+init(autoreset=True)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -12,6 +16,22 @@ logger = logging.getLogger(__name__)
 
 
 class AWSResourceMonitor:
+    RESOURCE_TYPE_COLORS = {
+        'lambda': Fore.BLUE,
+        'subnet': Fore.GREEN,
+        'security_group': Fore.YELLOW,
+        'network_acl': Fore.MAGENTA,
+        'vpc': Fore.CYAN
+    }
+
+    CHANGE_TYPE_COLORS = {
+        'configuration': Fore.BLUE,
+        'code': Fore.GREEN,
+        'permission': Fore.YELLOW,
+        'network': Fore.MAGENTA,
+        'critical': Fore.RED
+    }
+
     def __init__(self, resource_identifier: str, days: int, include_related: bool = False):
         """
         Initialize the AWS Resource Monitor
@@ -187,6 +207,68 @@ class AWSResourceMonitor:
 
         return changes
 
+    def _get_related_resources(self) -> List[Dict]:
+        """
+        Get related resources and their changes
+        """
+        related_resources = []
+        try:
+            # For Lambda, get VPC configuration
+            lambda_client = self.session.client('lambda')
+            function = lambda_client.get_function(FunctionName=self.resource_identifier)
+            vpc_config = function['Configuration'].get('VpcConfig', {})
+
+            if vpc_config:
+                # Get Security Groups changes
+                if vpc_config.get('SecurityGroupIds'):
+                    for sg_id in vpc_config['SecurityGroupIds']:
+                        sg_events = self._get_resource_events(sg_id, 'security_group')
+                        if sg_events:
+                            related_resources.append({
+                                'type': 'security_group',
+                                'identifier': sg_id,
+                                'changes': self._analyze_changes(sg_events)
+                            })
+
+                # Get Subnet changes
+                if vpc_config.get('SubnetIds'):
+                    for subnet_id in vpc_config['SubnetIds']:
+                        subnet_events = self._get_resource_events(subnet_id, 'subnet')
+                        if subnet_events:
+                            related_resources.append({
+                                'type': 'subnet',
+                                'identifier': subnet_id,
+                                'changes': self._analyze_changes(subnet_events)
+                            })
+        except ClientError as e:
+            logger.error(f"Error getting related resources: {e}")
+
+        return related_resources
+
+    def _get_resource_events(self, resource_id: str, resource_type: str) -> List[Dict]:
+        """
+        Get CloudTrail events for a specific resource
+        """
+        try:
+            events = []
+            paginator = self.cloudtrail.get_paginator('lookup_events')
+
+            for page in paginator.paginate(
+                    StartTime=self.start_time,
+                    LookupAttributes=[{
+                        'AttributeKey': 'ResourceName',
+                        'AttributeValue': resource_id
+                    }]
+            ):
+                for event in page.get('Events', []):
+                    if self._is_relevant_event(event):
+                        events.append(event)
+
+            return events
+        except ClientError as e:
+            logger.error(f"Error getting events for {resource_type} {resource_id}: {e}")
+            return []
+
     def analyze(self) -> Dict:
         """
         Main analysis method to detect and report changes
@@ -198,20 +280,42 @@ class AWSResourceMonitor:
         events = self._get_cloudtrail_events()
         changes = self._analyze_changes(events)
 
+        # Get related resource changes
+        related_resources = []
+        if self.include_related:
+            related_resources = self._get_related_resources()
+
         # Initialize the report
         report = {
             'resource_identifier': self.resource_identifier,
+            'resource_type': resource_type,
             'analysis_period_days': self.days,
             'analysis_time': datetime.utcnow().isoformat(),
             'changes': changes,
-            'related_resources': []
+            'related_resources': related_resources
         }
 
-        if self.include_related:
-            # TODO: Implement related resource analysis
-            pass
-
         return report
+
+
+def print_changes(changes: List[Dict], resource_type: str, indent: str = "") -> None:
+    """
+    Print changes with color formatting
+    """
+    for change in changes:
+        # Format timestamp
+        timestamp = datetime.strptime(str(change['timestamp']), "%Y-%m-%d %H:%M:%S%z")
+        formatted_time = timestamp.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        print(f"\n{indent}{Fore.WHITE}{formatted_time}")
+        print(f"{indent}Action: {Fore.CYAN}{change['event_type']}{Style.RESET_ALL}")
+        print(f"{indent}By: {Fore.YELLOW}{change['user']}{Style.RESET_ALL}")
+
+        if change.get('changes'):
+            print(f"{indent}Changes detected:")
+            for change_type, change_desc in change['changes'].items():
+                color = AWSResourceMonitor.CHANGE_TYPE_COLORS.get(change_type, Fore.WHITE)
+                print(f"{indent}  - {color}{change_type}: {change_desc}{Style.RESET_ALL}")
 
 
 def main():
@@ -232,22 +336,34 @@ def main():
 
         report = monitor.analyze()
 
-        print(f"\nChanges for {args.resource} in the last {args.d} days:")
-        if not report['changes']:
-            print("\nNo significant changes detected.")
-        else:
-            for change in report['changes']:
-                print(f"\n[{change['timestamp']}]")
-                print(f"Action: {change['event_type']}")
-                print(f"By: {change['user']}")
+        # Print header
+        print(f"\n{Fore.CYAN}{'=' * 80}{Style.RESET_ALL}")
+        print(f"{Fore.WHITE}Analysis Report for {Fore.GREEN}{args.resource}{Style.RESET_ALL}")
+        print(f"Time period: Last {args.d} days")
+        print(f"{Fore.CYAN}{'=' * 80}{Style.RESET_ALL}\n")
 
-                if change.get('changes'):
-                    print("Changes detected:")
-                    for change_type, change_desc in change['changes'].items():
-                        print(f"  - {change_type}: {change_desc}")
+        # Print main resource changes
+        print(f"{Fore.GREEN}Direct Resource Changes:{Style.RESET_ALL}")
+        if not report['changes']:
+            print(f"\n{Fore.YELLOW}No significant changes detected.{Style.RESET_ALL}")
+        else:
+            print_changes(report['changes'], report['resource_type'])
+
+        # Print related resource changes
+        if args.include_related and report['related_resources']:
+            print(f"\n{Fore.GREEN}Related Resource Changes:{Style.RESET_ALL}")
+            for related in report['related_resources']:
+                color = AWSResourceMonitor.RESOURCE_TYPE_COLORS.get(related['type'], Fore.WHITE)
+                print(f"\n{color}{related['type'].upper()}: {related['identifier']}{Style.RESET_ALL}")
+                if related['changes']:
+                    print_changes(related['changes'], related['type'], indent="  ")
+                else:
+                    print(f"  {Fore.YELLOW}No significant changes detected{Style.RESET_ALL}")
+
+        print(f"\n{Fore.CYAN}{'=' * 80}{Style.RESET_ALL}")
 
     except Exception as e:
-        logger.error(f"Error analyzing resource: {e}")
+        logger.error(f"{Fore.RED}Error analyzing resource: {e}{Style.RESET_ALL}")
         raise
 
 
