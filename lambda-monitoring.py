@@ -231,6 +231,36 @@ class AWSResourceMonitor:
 
         return {}
 
+    def _analyze_vpc_changes(self, event: Dict) -> Dict:
+        """Analyze VPC specific changes"""
+        changes = {}
+        try:
+            event_detail = json.loads(event.get('CloudTrailEvent', '{}'))
+            request_params = event_detail.get('requestParameters', {})
+
+            if 'ModifyVpcAttribute' in event['EventName']:
+                for attr in ['enableDnsHostnames', 'enableDnsSupport']:
+                    if attr in request_params:
+                        value = request_params[attr].get('value', 'unknown')
+                        changes['attribute'] = f"{attr} set to: {value}"
+
+            elif 'CreateVpcPeeringConnection' in event['EventName']:
+                peer_vpc = request_params.get('peerVpcId', 'unknown')
+                changes['peering'] = f"Created peering connection with VPC: {peer_vpc}"
+
+            elif 'AcceptVpcPeeringConnection' in event['EventName']:
+                connection_id = request_params.get('vpcPeeringConnectionId', 'unknown')
+                changes['peering'] = f"Accepted peering connection: {connection_id}"
+
+            elif 'AttachInternetGateway' in event['EventName']:
+                gateway_id = request_params.get('internetGatewayId', 'unknown')
+                changes['internet_gateway'] = f"Attached internet gateway: {gateway_id}"
+
+        except json.JSONDecodeError:
+            logger.warning("Could not parse CloudTrail event JSON")
+
+        return changes
+
     def _analyze_subnet_changes(self, event: Dict) -> Dict:
         """Analyze subnet specific changes"""
         changes = {}
@@ -428,10 +458,107 @@ def print_changes(changes: List[Dict], resource_type: str, indent: str = "") -> 
 
 
 def print_related_resources(resources: List[Dict]):
-    """Print related resources information"""
+    """Print related resources information with detailed configuration"""
     if not resources:
         print(f"\n{Fore.YELLOW}No related resources found{Style.RESET_ALL}")
         return
+
+    # Group resources by type
+    resource_groups = {
+        'vpc': [],
+        'security_group': [],
+        'subnet': [],
+        'iam_role': []
+    }
+
+    for resource in resources:
+        if resource['type'] in resource_groups:
+            resource_groups[resource['type']].append(resource)
+
+    # Print VPC information
+    if resource_groups['vpc']:
+        print(f"\n{Fore.CYAN}VPC Configuration:{Style.RESET_ALL}")
+        for vpc in resource_groups['vpc']:
+            print(f"\n  {Fore.WHITE}• VPC ID: {vpc['identifier']}{Style.RESET_ALL}")
+            print(f"    CIDR Block: {vpc['cidr']}")
+            print(f"    State: {vpc['state']}")
+            print(f"    Default VPC: {'Yes' if vpc['is_default'] else 'No'}")
+
+            if vpc['changes']:
+                print(f"\n    Changes detected:")
+                for change in vpc['changes']:
+                    print(f"\n    [{change['timestamp']}]")
+                    print(f"    Modified by: {change['user']}")
+                    for change_type, desc in change['changes'].items():
+                        print(f"      - {change_type}: {desc}")
+
+    # Print Security Groups
+    if resource_groups['security_group']:
+        print(f"\n{Fore.YELLOW}Security Groups:{Style.RESET_ALL}")
+        for sg in resource_groups['security_group']:
+            print(f"\n  {Fore.WHITE}• Security Group: {sg['identifier']}{Style.RESET_ALL}")
+            print(f"    Name: {sg['name']}")
+            print(f"    Description: {sg['description']}")
+            print(f"    VPC: {sg['vpc_id']}")
+
+            # Print current rules
+            if 'current_rules' in sg:
+                print("\n    Current Inbound Rules:")
+                for rule in sg['current_rules']['inbound']:
+                    protocol = rule.get('IpProtocol', 'All')
+                    from_port = rule.get('FromPort', 'All')
+                    to_port = rule.get('ToPort', 'All')
+                    sources = []
+                    for ip_range in rule.get('IpRanges', []):
+                        sources.append(ip_range.get('CidrIp', 'Unknown'))
+                    print(f"      - {protocol} {from_port}-{to_port} from {', '.join(sources)}")
+
+                print("\n    Current Outbound Rules:")
+                for rule in sg['current_rules']['outbound']:
+                    protocol = rule.get('IpProtocol', 'All')
+                    from_port = rule.get('FromPort', 'All')
+                    to_port = rule.get('ToPort', 'All')
+                    destinations = []
+                    for ip_range in rule.get('IpRanges', []):
+                        destinations.append(ip_range.get('CidrIp', 'Unknown'))
+                    print(f"      - {protocol} {from_port}-{to_port} to {', '.join(destinations)}")
+
+            if sg['changes']:
+                print(f"\n    Changes detected:")
+                for change in sg['changes']:
+                    print(f"\n    [{change['timestamp']}]")
+                    print(f"    Modified by: {change['user']}")
+                    for change_type, desc in change['changes'].items():
+                        print(f"      - {change_type}: {desc}")
+
+    # Print Subnets
+    if resource_groups['subnet']:
+        print(f"\n{Fore.GREEN}Subnets:{Style.RESET_ALL}")
+        for subnet in resource_groups['subnet']:
+            print(f"\n  {Fore.WHITE}• Subnet: {subnet['identifier']}{Style.RESET_ALL}")
+            print(f"    CIDR Block: {subnet['cidr']}")
+            print(f"    VPC: {subnet['vpc_id']}")
+            print(f"    Availability Zone: {subnet['az']}")
+            print(f"    Auto-assign Public IP: {'Yes' if subnet['public_ip_on_launch'] else 'No'}")
+            print(f"    Available IP Addresses: {subnet['available_ips']}")
+
+            # Print route tables
+            if subnet.get('route_tables'):
+                print("\n    Route Tables:")
+                for rt in subnet['route_tables']:
+                    print(f"      Route Table: {rt['RouteTableId']}")
+                    for route in rt.get('Routes', []):
+                        destination = route.get('DestinationCidrBlock', 'Unknown')
+                        target = route.get('GatewayId', route.get('NatGatewayId', 'Unknown'))
+                        print(f"        - {destination} -> {target}")
+
+            if subnet['changes']:
+                print(f"\n    Changes detected:")
+                for change in subnet['changes']:
+                    print(f"\n    [{change['timestamp']}]")
+                    print(f"    Modified by: {change['user']}")
+                    for change_type, desc in change['changes'].items():
+                        print(f"      - {change_type}: {desc}")
 
     # Group resources by type
     resource_groups = {
