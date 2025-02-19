@@ -139,37 +139,71 @@ class AWSResourceMonitor:
             events = []
             paginator = self.cloudtrail.get_paginator('lookup_events')
 
-            # Try different lookup attributes to catch more events
+            # Use the appropriate resource identifier
+            identifier = resource_id or self.resource_identifier
+
+            # CloudTrail only accepts certain attribute keys
             lookup_attributes = []
 
-            # Add ResourceName lookup
-            lookup_attributes.append({
-                'AttributeKey': 'ResourceName',
-                'AttributeValue': resource_id or self.resource_identifier
-            })
+            # Only add ResourceName if it's a valid identifier
+            if not identifier.startswith(('arn:', 'sg-', 'subnet-', 'vpc-')):
+                lookup_attributes.append({
+                    'AttributeKey': 'ResourceName',
+                    'AttributeValue': identifier
+                })
 
-            # Add ResourceId lookup
-            lookup_attributes.append({
-                'AttributeKey': 'ResourceId',
-                'AttributeValue': resource_id or self.resource_identifier
-            })
+            # Add ResourceType for specific resource types
+            if identifier.startswith('sg-'):
+                lookup_attributes.append({
+                    'AttributeKey': 'ResourceType',
+                    'AttributeValue': 'AWS::EC2::SecurityGroup'
+                })
+            elif identifier.startswith('subnet-'):
+                lookup_attributes.append({
+                    'AttributeKey': 'ResourceType',
+                    'AttributeValue': 'AWS::EC2::Subnet'
+                })
+            elif identifier.startswith('vpc-'):
+                lookup_attributes.append({
+                    'AttributeKey': 'ResourceType',
+                    'AttributeValue': 'AWS::EC2::VPC'
+                })
 
-            # For each lookup attribute
+            # If it's an ARN, use it directly
+            if identifier.startswith('arn:'):
+                lookup_attributes.append({
+                    'AttributeKey': 'ResourceName',
+                    'AttributeValue': identifier
+                })
+
+            # If we have a valid ID (sg-, subnet-, etc), use it
+            elif any(identifier.startswith(prefix) for prefix in ['sg-', 'subnet-', 'vpc-']):
+                lookup_attributes.append({
+                    'AttributeKey': 'ResourceName',
+                    'AttributeValue': identifier
+                })
+
+            # For each valid lookup attribute
             for lookup_attr in lookup_attributes:
                 try:
+                    logger.info(f"Looking up events with attribute: {lookup_attr}")
                     for page in paginator.paginate(
                             StartTime=self.start_time,
                             LookupAttributes=[lookup_attr]
                     ):
-                        events.extend([
+                        filtered_events = [
                             event for event in page.get('Events', [])
                             if self._is_relevant_event(event)
-                        ])
+                        ]
+                        events.extend(filtered_events)
+                        logger.info(f"Found {len(filtered_events)} relevant events for {lookup_attr}")
                 except ClientError as e:
                     logger.warning(f"Error with lookup attribute {lookup_attr}: {e}")
                     continue
 
-            return events
+            # Remove duplicate events
+            unique_events = {event['EventId']: event for event in events}.values()
+            return sorted(unique_events, key=lambda x: x['EventTime'])
 
         except ClientError as e:
             logger.error(f"Error retrieving CloudTrail events: {e}")
