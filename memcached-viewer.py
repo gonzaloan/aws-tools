@@ -2,7 +2,6 @@ import argparse
 from pymemcache.client.base import Client
 import sys
 
-
 def parse_arguments():
     parser = argparse.ArgumentParser(description='AWS Memcached Explorer Tool')
     parser.add_argument('--endpoint',
@@ -20,9 +19,7 @@ def parse_arguments():
     parser.add_argument('--stats',
                         action='store_true',
                         help='Show server statistics')
-
     return parser.parse_args()
-
 
 def connect_to_memcached(endpoint, port):
     try:
@@ -32,40 +29,43 @@ def connect_to_memcached(endpoint, port):
         print(f"Error connecting to Memcached: {e}")
         sys.exit(1)
 
-
 def list_keys(client):
     try:
         stats = client.stats('items')
-        items = []
-
+        print("\nFound keys:")
+        print("-" * 50)
+        
         for key in stats.keys():
             if b'items' in key:
                 slab_id = key.split(b':')[1]
-                items.extend(client.stats('cachedump', slab_id, 100))
-
-        print("\nFound keys:")
-        print("-" * 50)
-        for key in items:
-            value = client.get(key)
-            print(f"Key: {key}")
-            print(f"Value: {value}")
-            print("-" * 50)
-
+                try:
+                    items = client.stats('cachedump', slab_id, 0)  # 0 para obtener todos los items
+                    if items:
+                        for item_key in items:
+                            try:
+                                value = client.get(item_key.decode('utf-8'))
+                                print(f"Key: {item_key.decode('utf-8')}")
+                                print(f"Value: {value}")
+                                print("-" * 50)
+                            except Exception as e:
+                                print(f"Error reading key {item_key}: {e}")
+                except Exception as e:
+                    print(f"Error dumping slab {slab_id}: {e}")
     except Exception as e:
         print(f"Error listing keys: {e}")
-
 
 def get_key_value(client, key):
     try:
         value = client.get(key)
         if value is not None:
+            if isinstance(value, bytes):
+                value = value.decode('utf-8')
             print(f"\nKey: {key}")
             print(f"Value: {value}")
         else:
             print(f"\nKey '{key}' does not exist")
     except Exception as e:
         print(f"Error getting key value: {e}")
-
 
 def show_stats(client):
     try:
@@ -77,11 +77,10 @@ def show_stats(client):
     except Exception as e:
         print(f"Error getting statistics: {e}")
 
-
 def main():
     args = parse_arguments()
     client = connect_to_memcached(args.endpoint, args.port)
-
+    
     if args.list_keys:
         list_keys(client)
     elif args.get_key:
@@ -90,9 +89,10 @@ def main():
         show_stats(client)
     else:
         print("Please specify an action: --list-keys, --get-key, or --stats")
-
+    
     client.close()
-
 
 if __name__ == "__main__":
     main()
+Improve
+Explai
